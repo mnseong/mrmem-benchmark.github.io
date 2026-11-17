@@ -933,6 +933,8 @@ footer { font-size: 0.84rem; color: var(--muted); border-top: 1px solid var(--li
   // GIF export of the player panel, from the twin labels to the step readout: every frame is drawn on a canvas
   // from the clip's data (labels, phase lanes, legend, readout) and the video frame, then encoded with gifenc.
   const GIF_W = 800, GIF_MAX_FRAMES = 300, GIF_PAD = 14;
+  const GIF_LIMIT = 3e6, GIF_TARGET = 2.6e6;  // bytes: every GIF stays under 3 MB (aiming a little lower)
+  const GIF_SAMPLE = 8, GIF_MIN_FRAMES = 60, GIF_MIN_SCALE = 0.5, GIF_MAX_DELAY = 120, GIF_COLORS = 128;
   const cssVar = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
   const resolveColor = (c) => (c.startsWith("var(") ? cssVar(c.slice(4, -1)) : c);
 
@@ -955,7 +957,10 @@ footer { font-size: 0.84rem; color: var(--muted); border-top: 1px solid var(--li
     const C = { bg: cssVar("--surface"), ink: cssVar("--ink"), muted: cssVar("--muted"), line: cssVar("--line"),
                 soft: cssVar("--soft"), tw: [cssVar("--a"), cssVar("--b")] };
     const body = cssVar("--body"), mono = cssVar("--mono");
-    if (draw) { ctx.fillStyle = C.bg; ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height); }
+    if (draw) {  // the whole canvas, whatever the scale it is drawn at
+      const t = ctx.getTransform();
+      ctx.fillStyle = C.bg; ctx.fillRect(0, 0, ctx.canvas.width / t.a, ctx.canvas.height / t.d);
+    }
     ctx.textBaseline = "alphabetic";
     // Twin labels
     let lines = 1;
@@ -1067,7 +1072,10 @@ footer { font-size: 0.84rem; color: var(--muted); border-top: 1px solid var(--li
   }
 
   async function renderGif(key, camera, status) {
-    const d = SIM[key];
+    // Every GIF stays within GIF_LIMIT bytes: the bytes per frame are estimated from a sample of frames, which sets
+    // how many frames (and, if even GIF_MIN_FRAMES do not fit, how small an image) the GIF gets; a GIF that still
+    // comes out too large is encoded again with proportionally fewer frames. Long clips play as a time-lapse.
+    const d = SIM[key], n = d.frames.length;
     const { GIFEncoder, quantize, applyPalette } = await import("https://cdn.jsdelivr.net/npm/gifenc@1.0.3/dist/gifenc.esm.js");
     const src = document.createElement("video");
     src.muted = true; src.playsInline = true; src.preload = "auto";
@@ -1077,25 +1085,50 @@ footer { font-size: 0.84rem; color: var(--muted); border-top: 1px solid var(--li
       src.addEventListener("error", () => reject(new Error("the video did not load")), { once: true });
     });
     await document.fonts.ready;
-    const n = d.frames.length, stride = Math.max(1, Math.ceil(n / GIF_MAX_FRAMES));
     const canvas = document.createElement("canvas");
     canvas.width = GIF_W; canvas.height = 4000;
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    const spread = (count) => Array.from({ length: Math.min(count, n) }, (_, j) => Math.round(j * (n - 1) / Math.max(1, Math.min(count, n) - 1)));
     let height = 0;
-    for (let i = 0; i < n; i += stride) height = Math.max(height, drawPanel(ctx, d, i, src, false));
-    canvas.height = height;
-    const gif = GIFEncoder(), delay = Math.max(20, Math.round(1000 * stride / d.fps));
-    for (let i = 0; i < n; i += stride) {
-      await seekVideo(src, (i + 0.5) / d.fps);
-      drawPanel(ctx, d, i, src, true);
-      const { data } = ctx.getImageData(0, 0, GIF_W, height);
-      const palette = quantize(data, 256);
-      gif.writeFrame(applyPalette(data, palette), GIF_W, height, { palette, delay });
-      status.textContent = `Rendering GIF\u2026 ${Math.round(100 * i / n)}%`;
+    for (const i of spread(GIF_MAX_FRAMES)) height = Math.max(height, drawPanel(ctx, d, i, src, false));
+
+    async function encode(frames, scale, report) {
+      const w = Math.round(GIF_W * scale), h = Math.round(height * scale);
+      canvas.width = w; canvas.height = h;
+      ctx.setTransform(scale, 0, 0, scale, 0, 0);
+      const step = n / frames.length;
+      const delay = Math.min(GIF_MAX_DELAY, Math.max(20, Math.round(1000 * step / d.fps)));
+      const gif = GIFEncoder();
+      for (let j = 0; j < frames.length; j++) {
+        await seekVideo(src, (frames[j] + 0.5) / d.fps);
+        drawPanel(ctx, d, frames[j], src, true);
+        const { data } = ctx.getImageData(0, 0, w, h);
+        const palette = quantize(data, GIF_COLORS);
+        gif.writeFrame(applyPalette(data, palette), w, h, { palette, delay });
+        if (report) status.textContent = `Rendering GIF… ${Math.round(100 * (j + 1) / frames.length)}%`;
+      }
+      gif.finish();
+      return gif.bytes();
     }
-    gif.finish();
+
+    status.textContent = "Sizing the GIF…";
+    let scale = 1, count = Math.min(GIF_MAX_FRAMES, n);
+    for (;;) {
+      const sample = spread(GIF_SAMPLE);
+      const perFrame = (await encode(sample, scale, false)).length / sample.length;
+      count = Math.min(GIF_MAX_FRAMES, n, Math.floor(GIF_TARGET / perFrame));
+      if (count >= GIF_MIN_FRAMES || scale <= GIF_MIN_SCALE) break;
+      scale = Math.max(GIF_MIN_SCALE, scale * 0.8);
+    }
+    let bytes = await encode(spread(Math.max(2, count)), scale, true);
+    for (let tries = 0; bytes.length > GIF_LIMIT && tries < 4; tries++) {
+      count = Math.max(2, Math.floor(count * 0.92 * GIF_LIMIT / bytes.length));
+      if (count < GIF_MIN_FRAMES && scale > GIF_MIN_SCALE) scale = Math.max(GIF_MIN_SCALE, scale * 0.8);
+      bytes = await encode(spread(count), scale, true);
+    }
     src.removeAttribute("src"); src.load();
-    return new Blob([gif.bytes()], { type: "image/gif" });
+    if (bytes.length > GIF_LIMIT) throw new Error("could not fit the GIF into 3 MB");
+    return new Blob([bytes], { type: "image/gif" });
   }
 
   function browserSave({ filename, data }) {  // outside claude.ai (a static copy of the page): a plain download
